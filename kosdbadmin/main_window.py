@@ -1,0 +1,192 @@
+"""Main window for KosDBAdmin."""
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QTabWidget, QAction, QMessageBox,
+    QLabel, QStatusBar, QToolBar, QFileDialog
+)
+
+from kosdbadmin.client import KosDBClient, KosDBError
+from kosdbadmin.connection_dialog import ConnectionDialog
+from kosdbadmin.tree_panel import TreePanel
+from kosdbadmin.query_widget import QueryWidget
+from kosdbadmin.table_browser import TableBrowser
+
+
+class MainWindow(QMainWindow):
+    """Main application window."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("KosDBAdmin")
+        self.setMinimumSize(1000, 700)
+
+        self.client: KosDBClient = None
+
+        self._build_menu()
+        self._build_toolbar()
+        self._build_central()
+        self._build_status()
+
+        self.show_connection_dialog()
+
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("File")
+        connect_action = QAction("Connect...", self)
+        connect_action.setShortcut("Ctrl+N")
+        connect_action.triggered.connect(self.show_connection_dialog)
+        file_menu.addAction(connect_action)
+
+        disconnect_action = QAction("Disconnect", self)
+        disconnect_action.triggered.connect(self.disconnect)
+        file_menu.addAction(disconnect_action)
+
+        file_menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        tools_menu = menubar.addMenu("Tools")
+        refresh_action = QAction("Refresh tree", self)
+        refresh_action.setShortcut("F5")
+        refresh_action.triggered.connect(self.refresh_tree)
+        tools_menu.addAction(refresh_action)
+
+        help_menu = menubar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+    def _build_toolbar(self):
+        toolbar = QToolBar()
+        self.addToolBar(toolbar)
+
+        connect_btn = QAction("Connect", self)
+        connect_btn.triggered.connect(self.show_connection_dialog)
+        toolbar.addAction(connect_btn)
+
+        refresh_btn = QAction("Refresh", self)
+        refresh_btn.triggered.connect(self.refresh_tree)
+        toolbar.addAction(refresh_btn)
+
+    def _build_central(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        self.splitter = QSplitter(Qt.Horizontal)
+
+        self.tree_panel = None
+        self.tree_container = QWidget()
+        self.tree_layout = QVBoxLayout(self.tree_container)
+        self.tree_layout.setContentsMargins(0, 0, 0, 0)
+        self.tree_label = QLabel("Not connected")
+        self.tree_layout.addWidget(self.tree_label)
+        self.splitter.addWidget(self.tree_container)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.splitter.addWidget(self.tabs)
+
+        self.splitter.setSizes([250, 750])
+        layout.addWidget(self.splitter)
+
+    def _build_status(self):
+        self.status = QStatusBar()
+        self.status_label = QLabel("Disconnected")
+        self.status.addWidget(self.status_label)
+        self.setStatusBar(self.status)
+
+    def show_connection_dialog(self):
+        if self.client:
+            self.client.disconnect()
+
+        dlg = ConnectionDialog(self, host="localhost", port=3306,
+                               username="admin", password="")
+        if dlg.exec_() == ConnectionDialog.Accepted:
+            self.set_client(dlg.get_client())
+        else:
+            if not self.client:
+                self.status_label.setText("Disconnected")
+
+    def set_client(self, client: KosDBClient):
+        self.client = client
+        self.status_label.setText(f"Connected to {client.host}:{client.port} as {client.username}")
+
+        # Replace tree panel
+        if self.tree_panel:
+            self.tree_layout.removeWidget(self.tree_panel)
+            self.tree_panel.deleteLater()
+        self.tree_label.setText(f"{client.host}:{client.port}")
+        self.tree_panel = TreePanel(client)
+        self.tree_panel.database_selected.connect(self.on_database_selected)
+        self.tree_panel.table_selected.connect(self.on_table_selected)
+        self.tree_layout.addWidget(self.tree_panel)
+        self.tree_panel.refresh()
+
+        # Add default query tab
+        self.add_query_tab()
+
+    def disconnect(self):
+        if self.client:
+            self.client.disconnect()
+            self.client = None
+        self.status_label.setText("Disconnected")
+        self.tabs.clear()
+        if self.tree_panel:
+            self.tree_panel.deleteLater()
+            self.tree_panel = None
+        self.tree_label.setText("Not connected")
+
+    def refresh_tree(self):
+        if self.tree_panel:
+            self.tree_panel.refresh()
+
+    def on_database_selected(self, db_name: str):
+        pass
+
+    def on_table_selected(self, db_name: str, table_name: str):
+        self.open_table_tab(db_name, table_name)
+
+    def add_query_tab(self):
+        widget = QueryWidget(self.client)
+        index = self.tabs.addTab(widget, "Query")
+        self.tabs.setCurrentIndex(index)
+        return widget
+
+    def open_table_tab(self, db_name: str, table_name: str):
+        title = f"{db_name}.{table_name}"
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == title:
+                self.tabs.setCurrentIndex(i)
+                return
+
+        browser = TableBrowser(self.client)
+        browser.load(db_name, table_name)
+        index = self.tabs.addTab(browser, title)
+        self.tabs.setCurrentIndex(index)
+
+    def close_tab(self, index: int):
+        # Keep at least one query tab if it's the only tab
+        widget = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        widget.deleteLater()
+
+    def show_about(self):
+        QMessageBox.about(
+            self, "About KosDBAdmin",
+            "<b>KosDBAdmin</b><br>"
+            "A PyQt5 administration client for KosDB.<br><br>"
+            "Version 0.1.0"
+        )
+
+    def closeEvent(self, event):
+        if self.client:
+            self.client.disconnect()
+        event.accept()
