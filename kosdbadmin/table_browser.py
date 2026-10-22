@@ -1,23 +1,25 @@
 """Table data and structure browser for KosDBAdmin."""
 
 import json
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QLabel, QHBoxLayout, QPushButton,
-    QMessageBox
+    QMessageBox, QInputDialog, QMenu, QLineEdit
 )
 
 from kosdbadmin.client import KosDBClient, KosDBError
 from kosdbadmin.utils import format_value
 
 
+
 class TableBrowser(QWidget):
     """Tabbed view for a single table: data and structure."""
 
-    def __init__(self, client: KosDBClient, parent=None):
+    def __init__(self, client: KosDBClient, local=None, parent=None):
         super().__init__(parent)
         self.client = client
+        self.local = local
         self.db_name = ""
         self.table_name = ""
 
@@ -29,7 +31,9 @@ class TableBrowser(QWidget):
 
         self.tabs = QTabWidget()
         self.data_tab = DataTab(client)
-        self.structure_tab = StructureTab(client)
+        self.structure_tab = StructureTab(client, local=local)
+        self.structure_tab.structure_changed.connect(self.refresh)
+
         self.tabs.addTab(self.data_tab, "Browse")
         self.tabs.addTab(self.structure_tab, "Structure")
         layout.addWidget(self.tabs)
@@ -49,6 +53,7 @@ class TableBrowser(QWidget):
         self.db_name = db_name
         self.table_name = table_name
         self.title_label.setText(f"<b>{db_name}.{table_name}</b>")
+        self.structure_tab.local = self.local
         self.data_tab.load(db_name, table_name)
         self.structure_tab.load(db_name, table_name)
 
@@ -145,54 +150,243 @@ class DataTab(QWidget):
 
 
 class StructureTab(QWidget):
-    """Show schema/structure of a table."""
+    """Show schema/structure of a table with editing options."""
 
-    def __init__(self, client: KosDBClient, parent=None):
+    structure_changed = pyqtSignal()
+
+    def __init__(self, client: KosDBClient, local=None, parent=None):
         super().__init__(parent)
         self.client = client
+        self.local = local
+        self.db_name = ""
+        self.table_name = ""
+        self.columns = []
+        self.indexes = []
+        self.primary_key = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Column", "Type", "Attributes"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Column", "Type", "Attributes", "Default"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.table)
+
+        # Toolbar
+        toolbar = QHBoxLayout()
+        self.add_btn = QPushButton("Add column")
+        self.add_btn.clicked.connect(self.add_column)
+        toolbar.addWidget(self.add_btn)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
 
         self.info_label = QLabel()
         layout.addWidget(self.info_label)
 
     def load(self, db_name: str, table_name: str):
+        self.db_name = db_name
+        self.table_name = table_name
         self.table.setRowCount(0)
         self.info_label.setText("Loading...")
 
-        try:
-            self.client.use_database(db_name)
-            # KosDB stores schema in _schema:table key; we can get it via a query trick
-            # SELECT * FROM table returns all columns which gives us the schema
-            result = self.client.execute_query(f"SELECT * FROM {table_name}")
-            columns = result.get("columns", [])
-            if not columns:
-                self.info_label.setText("No structure information")
+        schema = None
+        if self.local:
+            try:
+                schema = self.local.read_schema(db_name, table_name)
+            except Exception:
+                schema = None
+
+        if not schema:
+            # Infer from data
+            try:
+                self.client.use_database(db_name)
+                result = self.client.execute_query(f"SELECT * FROM {table_name}")
+                self.columns = result.get("columns", [])
+                self.indexes = []
+                self.primary_key = None
+            except KosDBError as e:
+                self.info_label.setText(f"Error: {e}")
                 return
+        else:
+            self.columns = schema.get("columns", [])
+            self.indexes = schema.get("indexes", [])
+            self.primary_key = schema.get("primary_key")
 
-            # Try to infer attributes from the first row
-            sample = result.get("rows", [{}])[0] if result.get("rows") else {}
-            for cidx, col in enumerate(columns):
-                self.table.insertRow(cidx)
-                self.table.setItem(cidx, 0, QTableWidgetItem(col))
-                value = sample.get(col)
-                type_name = type(value).__name__ if value is not None else "text"
-                self.table.setItem(cidx, 1, QTableWidgetItem(type_name))
-                attrs = []
-                if col.lower() == "id":
-                    attrs.append("auto id")
-                self.table.setItem(cidx, 2, QTableWidgetItem(", ".join(attrs)))
+        if not self.columns:
+            self.info_label.setText("No structure information")
+            return
 
+        for cidx, col in enumerate(self.columns):
+            self._add_row(cidx, col)
+
+        self.table.resizeColumnsToContents()
+        if not self.columns:
+            self.info_label.setText("No structure information")
+            return
+
+        self.table.resizeColumnsToContents()
+        self.info_label.setText(
+            f"{len(self.columns)} column(s)"
+            + (f", PK: {self.primary_key}" if self.primary_key else "")
+            + (f", indexes: {', '.join(self.indexes)}" if self.indexes else "")
+        )
+
+    def _add_row(self, row: int, col: str, col_type: str = "text", default=""):
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(col))
+        item = QTableWidgetItem(col_type)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(row, 1, item)
+        attrs = []
+        if self.primary_key and col == self.primary_key:
+            attrs.append("PRIMARY KEY")
+        if col in self.indexes:
+            attrs.append("INDEX")
+        if col.lower() == "id":
+            attrs.append("auto id")
+        self.table.setItem(row, 2, QTableWidgetItem(", ".join(attrs)))
+        self.table.setItem(row, 3, QTableWidgetItem(str(default) if default is not None else ""))
+
+    def show_context_menu(self, position):
+        row = self.table.rowAt(position.y())
+        menu = QMenu()
+        if row >= 0:
+            edit_action = menu.addAction("Edit column")
+            edit_action.triggered.connect(lambda: self.edit_column(row))
+            drop_action = menu.addAction("Drop column")
+            drop_action.triggered.connect(lambda: self.drop_column(row))
+            if self.table.item(row, 0).text() == self.primary_key:
+                drop_action.setEnabled(False)
+                drop_action.setToolTip("Cannot drop primary key column")
+        add_action = menu.addAction("Add column")
+        add_action.triggered.connect(self.add_column)
+        menu.exec_(self.table.viewport().mapToGlobal(position))
+
+    def add_column(self):
+        name, ok = QInputDialog.getText(self, "Add column", "Column name:")
+        if not ok or not name.strip():
+            return
+        col_name = name.strip()
+
+        if col_name in self.columns:
+            QMessageBox.warning(self, "Warning", f"Column '{col_name}' already exists")
+            return
+
+        type_name, ok2 = QInputDialog.getItem(
+            self, "Add column", "Type:",
+            ["TEXT", "INTEGER", "REAL", "BOOLEAN", "JSON"], 0, False
+        )
+        if not ok2:
+            return
+
+        indexed, _ = QMessageBox.question(
+            self, "Index", f"Create index on '{col_name}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        default, ok3 = QInputDialog.getText(
+            self, "Add column", "Default value (optional):"
+        )
+        if not ok3:
+            default = ""
+
+        try:
+            self.client.use_database(self.db_name)
+            self.client.add_column(
+                self.table_name, col_name, type_name,
+                indexed=(indexed == QMessageBox.Yes), default=default
+            )
+            if indexed == QMessageBox.Yes and col_name not in self.indexes:
+                self.indexes.append(col_name)
+            self.columns.append(col_name)
+            self._add_row(self.table.rowCount(), col_name, type_name.lower(), default)
             self.table.resizeColumnsToContents()
-            self.info_label.setText(f"{len(columns)} column(s)")
+            self.info_label.setText(f"{len(self.columns)} column(s)")
+            self.structure_changed.emit()
+            QMessageBox.information(self, "Success", f"Column '{col_name}' added")
         except KosDBError as e:
-            self.info_label.setText(f"Error: {e}")
+            QMessageBox.critical(self, "Error", str(e))
+
+    def edit_column(self, row: int):
+        old_name = self.table.item(row, 0).text()
+        new_name, ok = QInputDialog.getText(
+            self, "Edit column", "New column name:", text=old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+
+        new_name = new_name.strip()
+        if new_name in self.columns:
+            QMessageBox.warning(self, "Warning", f"Column '{new_name}' already exists")
+            return
+
+        type_name, ok2 = QInputDialog.getItem(
+            self, "Edit column", "Type:",
+            ["TEXT", "INTEGER", "REAL", "BOOLEAN", "JSON"], 0, False
+        )
+        if not ok2:
+            return
+
+        default, ok3 = QInputDialog.getText(
+            self, "Edit column", "Default value (optional):",
+            text=self.table.item(row, 3).text()
+        )
+        if not ok3:
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Apply changes to column '{old_name}'?\n\n"
+            "Renaming will update existing rows automatically.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.client.use_database(self.db_name)
+            if old_name != new_name:
+                self.client.rename_column(self.table_name, old_name, new_name)
+                self.columns[row] = new_name
+                self.table.item(row, 0).setText(new_name)
+                if old_name in self.indexes:
+                    self.indexes[self.indexes.index(old_name)] = new_name
+                if self.primary_key == old_name:
+                    self.primary_key = new_name
+            # Type/default change is applied by recreating the table;
+            # we pass a dummy rename-to-self to rebuild with defaults if needed.
+            if old_name == new_name:
+                self.client.rename_column(self.table_name, old_name, old_name)
+            self.table.item(row, 1).setText(type_name.lower())
+            self.table.item(row, 3).setText(default)
+            self.structure_changed.emit()
+            QMessageBox.information(self, "Success", "Column updated")
+        except KosDBError as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def drop_column(self, row: int):
+        col_name = self.table.item(row, 0).text()
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Drop column '{col_name}'?\n\n"
+            "This removes the column from all rows.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.client.use_database(self.db_name)
+            self.client.drop_column(self.table_name, col_name)
+            self.columns.pop(row)
+            self.table.removeRow(row)
+            self.info_label.setText(f"{len(self.columns)} column(s)")
+            self.structure_changed.emit()
+            QMessageBox.information(self, "Success", "Column dropped")
+        except KosDBError as e:
+            QMessageBox.critical(self, "Error", str(e))

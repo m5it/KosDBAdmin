@@ -1,5 +1,7 @@
 """Main window for KosDBAdmin."""
 
+import os
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -9,6 +11,7 @@ from PyQt5.QtWidgets import (
 
 from kosdbadmin.client import KosDBClient, KosDBError
 from kosdbadmin.connection_dialog import ConnectionDialog
+from kosdbadmin.kosdb_local import KosDBLocal
 from kosdbadmin.tree_panel import TreePanel
 from kosdbadmin.query_widget import QueryWidget
 from kosdbadmin.table_browser import TableBrowser
@@ -23,6 +26,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 700)
 
         self.client: KosDBClient = None
+        self.local: KosDBLocal = None
 
         self._build_menu()
         self._build_toolbar()
@@ -51,6 +55,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         tools_menu = menubar.addMenu("Tools")
+        query_action = QAction("New query tab", self)
+        query_action.setShortcut("Ctrl+T")
+        query_action.triggered.connect(self.add_query_tab)
+        tools_menu.addAction(query_action)
+
         refresh_action = QAction("Refresh tree", self)
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_tree)
@@ -68,6 +77,10 @@ class MainWindow(QMainWindow):
         connect_btn = QAction("Connect", self)
         connect_btn.triggered.connect(self.show_connection_dialog)
         toolbar.addAction(connect_btn)
+
+        query_btn = QAction("New query", self)
+        query_btn.triggered.connect(self.add_query_tab)
+        toolbar.addAction(query_btn)
 
         refresh_btn = QAction("Refresh", self)
         refresh_btn.triggered.connect(self.refresh_tree)
@@ -117,6 +130,8 @@ class MainWindow(QMainWindow):
 
     def set_client(self, client: KosDBClient):
         self.client = client
+        # Try to locate the server's data directory for local metadata reads.
+        self.local = KosDBLocal(self._guess_data_dir())
         self.status_label.setText(f"Connected to {client.host}:{client.port} as {client.username}")
 
         # Replace tree panel
@@ -156,9 +171,17 @@ class MainWindow(QMainWindow):
 
     def add_query_tab(self):
         widget = QueryWidget(self.client)
-        index = self.tabs.addTab(widget, "Query")
+        title = self._next_query_tab_title()
+        index = self.tabs.addTab(widget, title)
         self.tabs.setCurrentIndex(index)
         return widget
+
+    def _next_query_tab_title(self) -> str:
+        existing = {self.tabs.tabText(i) for i in range(self.tabs.count())}
+        n = 1
+        while f"Query {n}" in existing:
+            n += 1
+        return f"Query {n}"
 
     def open_table_tab(self, db_name: str, table_name: str):
         title = f"{db_name}.{table_name}"
@@ -167,16 +190,19 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
 
-        browser = TableBrowser(self.client)
+        browser = TableBrowser(self.client, local=self.local)
         browser.load(db_name, table_name)
         index = self.tabs.addTab(browser, title)
         self.tabs.setCurrentIndex(index)
 
     def close_tab(self, index: int):
-        # Keep at least one query tab if it's the only tab
         widget = self.tabs.widget(index)
         self.tabs.removeTab(index)
         widget.deleteLater()
+
+        # Always keep at least one query tab available.
+        if self._query_tab_count() == 0 and self.client:
+            self.add_query_tab()
 
     def show_about(self):
         QMessageBox.about(
@@ -185,6 +211,28 @@ class MainWindow(QMainWindow):
             "A PyQt5 administration client for KosDB.<br><br>"
             "Version 0.1.0"
         )
+
+    def _query_tab_count(self) -> int:
+        return sum(
+            1 for i in range(self.tabs.count())
+            if self.tabs.tabText(i).startswith("Query")
+        )
+
+    def _guess_data_dir(self) -> str:
+        """Guess the KosDB server data directory."""
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.abspath(os.path.join(base, "..", "..", "..", "KosDB", "data")),
+            os.path.abspath(os.path.join(base, "..", "..", "KosDB", "data")),
+            os.path.abspath(os.path.join(base, "..", "KosDB", "data")),
+            os.path.join(os.path.expanduser("~"), "Working", "Hobies", "KosDB", "data"),
+            "/home/t3ch/Working/Hobies/KosDB/data",
+            os.path.abspath("data"),
+        ]
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        return candidates[-1]
 
     def closeEvent(self, event):
         if self.client:
