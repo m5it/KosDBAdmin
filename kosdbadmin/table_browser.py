@@ -5,10 +5,11 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QLabel, QHBoxLayout, QPushButton,
-    QMessageBox, QInputDialog, QMenu, QLineEdit
+    QMessageBox, QInputDialog, QMenu, QDialog
 )
 
 from kosdbadmin.client import KosDBClient, KosDBError
+from kosdbadmin.column_dialog import ColumnDialog
 from kosdbadmin.utils import format_value
 
 
@@ -98,6 +99,8 @@ class TableBrowser(QWidget):
         except ValueError:
             escaped = value.replace("'", "''")
             return f"'{escaped}'"
+
+
 
 
 class DataTab(QWidget):
@@ -202,32 +205,23 @@ class StructureTab(QWidget):
                 schema = None
 
         if not schema:
-            # Infer from data
             try:
                 self.client.use_database(db_name)
-                result = self.client.execute_query(f"SELECT * FROM {table_name}")
-                self.columns = result.get("columns", [])
-                self.indexes = []
-                self.primary_key = None
+                schema = self.client._infer_schema(table_name)
             except KosDBError as e:
                 self.info_label.setText(f"Error: {e}")
                 return
-        else:
-            self.columns = schema.get("columns", [])
-            self.indexes = schema.get("indexes", [])
-            self.primary_key = schema.get("primary_key")
 
-        if not self.columns:
+        if not schema:
             self.info_label.setText("No structure information")
             return
+
+        self.columns = schema.get("columns", [])
+        self.indexes = schema.get("indexes", [])
+        self.primary_key = schema.get("primary_key")
 
         for cidx, col in enumerate(self.columns):
             self._add_row(cidx, col)
-
-        self.table.resizeColumnsToContents()
-        if not self.columns:
-            self.info_label.setText("No structure information")
-            return
 
         self.table.resizeColumnsToContents()
         self.info_label.setText(
@@ -245,10 +239,11 @@ class StructureTab(QWidget):
         attrs = []
         if self.primary_key and col == self.primary_key:
             attrs.append("PRIMARY KEY")
+            # Only show auto id when id is the actual primary key
+            if col.lower() == "id":
+                attrs.append("auto id")
         if col in self.indexes:
             attrs.append("INDEX")
-        if col.lower() == "id":
-            attrs.append("auto id")
         self.table.setItem(row, 2, QTableWidgetItem(", ".join(attrs)))
         self.table.setItem(row, 3, QTableWidgetItem(str(default) if default is not None else ""))
 
@@ -256,11 +251,17 @@ class StructureTab(QWidget):
         row = self.table.rowAt(position.y())
         menu = QMenu()
         if row >= 0:
+            col_name = self.table.item(row, 0).text()
+            is_pk = col_name == self.primary_key
             edit_action = menu.addAction("Edit column")
             edit_action.triggered.connect(lambda: self.edit_column(row))
             drop_action = menu.addAction("Drop column")
             drop_action.triggered.connect(lambda: self.drop_column(row))
-            if self.table.item(row, 0).text() == self.primary_key:
+            if is_pk and col_name.lower() != "id":
+                # Non-id primary keys cannot be edited because we can't safely
+                # reassign PK values.
+                edit_action.setEnabled(False)
+                edit_action.setToolTip("Cannot edit primary key column")
                 drop_action.setEnabled(False)
                 drop_action.setToolTip("Cannot drop primary key column")
         add_action = menu.addAction("Add column")
@@ -268,109 +269,157 @@ class StructureTab(QWidget):
         menu.exec_(self.table.viewport().mapToGlobal(position))
 
     def add_column(self):
-        name, ok = QInputDialog.getText(self, "Add column", "Column name:")
-        if not ok or not name.strip():
+        has_pk = bool(self.primary_key)
+        dlg = ColumnDialog(self, allow_pk=not has_pk, allow_autoincrement=True)
+        if dlg.exec_() != QDialog.Accepted:
             return
-        col_name = name.strip()
 
+        col_name = dlg.name_edit.text().strip()
+        if not col_name:
+            return
         if col_name in self.columns:
             QMessageBox.warning(self, "Warning", f"Column '{col_name}' already exists")
             return
 
-        type_name, ok2 = QInputDialog.getItem(
-            self, "Add column", "Type:",
-            ["TEXT", "INTEGER", "REAL", "BOOLEAN", "JSON"], 0, False
-        )
-        if not ok2:
-            return
-
-        indexed = QMessageBox.question(
-            self, "Index", f"Create index on '{col_name}'?",
-            QMessageBox.Yes | QMessageBox.No
-        ) == QMessageBox.Yes
-
-        default, ok3 = QInputDialog.getText(
-            self, "Add column", "Default value (optional):"
-        )
-        if not ok3:
-            default = ""
+        type_name = dlg.type_combo.currentText()
+        default = dlg.default_edit.text()
+        attr = dlg.attribute()
 
         try:
             self.client.use_database(self.db_name)
-            self.client.add_column(
-                self.table_name, col_name, type_name,
-                indexed=(indexed == QMessageBox.Yes), default=default
+            new_columns = list(self.columns)
+            new_columns.append(col_name)
+            new_indexes = list(self.indexes)
+            new_pk = self.primary_key
+
+            if attr == "INDEX" and col_name not in new_indexes:
+                new_indexes.append(col_name)
+            if attr in ("PRIMARY KEY", "AUTO INCREMENT"):
+                new_pk = col_name
+                # Reordering: put PK column first for clarity.
+                if col_name in new_columns:
+                    new_columns.remove(col_name)
+                new_columns.insert(0, col_name)
+
+            self.client.alter_table(
+                self.table_name, new_columns,
+                primary_key=new_pk,
+                indexes=new_indexes
             )
-            if indexed == QMessageBox.Yes and col_name not in self.indexes:
-                self.indexes.append(col_name)
-            self.columns.append(col_name)
+
+            if default:
+                self.client.execute_command(
+                    f"UPDATE {self.table_name} SET {col_name}="
+                    f"'{default.replace(chr(39), chr(39)+chr(39))}'"
+                )
+
+            self.columns = new_columns
+            self.indexes = new_indexes
+            self.primary_key = new_pk
             self._add_row(self.table.rowCount(), col_name, type_name.lower(), default)
             self.table.resizeColumnsToContents()
             self.info_label.setText(f"{len(self.columns)} column(s)")
             self.structure_changed.emit()
-            QMessageBox.information(self, "Success", f"Column '{col_name}' added")
         except KosDBError as e:
             QMessageBox.critical(self, "Error", str(e))
 
     def edit_column(self, row: int):
         old_name = self.table.item(row, 0).text()
-        new_name, ok = QInputDialog.getText(
-            self, "Edit column", "New column name:", text=old_name
-        )
-        if not ok or not new_name.strip() or new_name.strip() == old_name:
+        old_type = self.table.item(row, 1).text()
+        old_default = self.table.item(row, 3).text()
+        is_pk = old_name == self.primary_key
+        was_indexed = old_name in self.indexes
+        current_attr = "PRIMARY KEY" if is_pk else ("INDEX" if was_indexed else "(none)")
+
+        has_pk = bool(self.primary_key)
+        is_autoincrement = is_pk and old_name.lower() == "id"
+        current_attr = "PRIMARY KEY" if is_pk else ("INDEX" if was_indexed else "(none)")
+        if is_autoincrement:
+            current_attr = "AUTO INCREMENT"
+
+        dlg = ColumnDialog(self, name=old_name, col_type=old_type,
+                           default=old_default, attribute=current_attr,
+                           edit_mode=True, is_pk=is_pk,
+                           allow_pk=not has_pk,
+                           allow_autoincrement=(old_type.upper() == "INTEGER"))
+        if dlg.exec_() != QDialog.Accepted:
             return
 
-        new_name = new_name.strip()
-        if new_name in self.columns:
+        new_name = dlg.name_edit.text().strip()
+        if not new_name:
+            return
+        if new_name != old_name and new_name in self.columns:
             QMessageBox.warning(self, "Warning", f"Column '{new_name}' already exists")
             return
 
-        type_name, ok2 = QInputDialog.getItem(
-            self, "Edit column", "Type:",
-            ["TEXT", "INTEGER", "REAL", "BOOLEAN", "JSON"], 0, False
-        )
-        if not ok2:
-            return
-
-        default, ok3 = QInputDialog.getText(
-            self, "Edit column", "Default value (optional):",
-            text=self.table.item(row, 3).text()
-        )
-        if not ok3:
-            return
-
-        reply = QMessageBox.question(
-            self, "Confirm",
-            f"Apply changes to column '{old_name}'?\n\n"
-            "Renaming will update existing rows automatically.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+        type_name = dlg.type_combo.currentText()
+        default = dlg.default_edit.text()
+        new_attr = dlg.attribute()
 
         try:
             self.client.use_database(self.db_name)
             if old_name != new_name:
-                self.client.rename_column(self.table_name, old_name, new_name)
                 self.columns[row] = new_name
                 self.table.item(row, 0).setText(new_name)
                 if old_name in self.indexes:
                     self.indexes[self.indexes.index(old_name)] = new_name
                 if self.primary_key == old_name:
                     self.primary_key = new_name
-            # Type/default change is applied by recreating the table;
-            # we pass a dummy rename-to-self to rebuild with defaults if needed.
-            if old_name == new_name:
-                self.client.rename_column(self.table_name, old_name, old_name)
+
+            # Apply attribute change for non-PK columns.
+            if not is_pk:
+                if new_attr == "INDEX" and new_name not in self.indexes:
+                    self.indexes.append(new_name)
+                elif new_attr == "" and new_name in self.indexes:
+                    self.indexes.remove(new_name)
+                elif new_attr in ("PRIMARY KEY", "AUTO INCREMENT"):
+                    self.primary_key = new_name
+                    # Move PK column first.
+                    if new_name in self.columns:
+                        self.columns.remove(new_name)
+                    self.columns.insert(0, new_name)
+                    if new_name in self.indexes:
+                        self.indexes.remove(new_name)
+
+            # Apply attribute change via server-side ALTER TABLE when possible.
+            if old_name == new_name and type_name.upper() == old_type.upper():
+                # Only metadata changed; use lightweight server command.
+                if self.primary_key == new_name:
+                    attr_cmd = "AUTO_INCREMENT" if new_name.lower() == "id" else "PRIMARY KEY"
+                elif new_name in self.indexes:
+                    attr_cmd = "INDEX"
+                else:
+                    attr_cmd = "NONE"
+                self.client.execute_command(
+                    f"ALTER TABLE {self.table_name} MODIFY COLUMN {new_name} {type_name} {attr_cmd}"
+                )
+            else:
+                # Rebuild table with updated metadata.
+                self.client.alter_table(
+                    self.table_name, self.columns,
+                    primary_key=self.primary_key,
+                    indexes=self.indexes
+                )
+            if default:
+                self.client.execute_command(
+                    f"UPDATE {self.table_name} SET {new_name}="
+                    f"'{default.replace(chr(39), chr(39)+chr(39))}'"
+                )
             self.table.item(row, 1).setText(type_name.lower())
             self.table.item(row, 3).setText(default)
             self.structure_changed.emit()
-            QMessageBox.information(self, "Success", "Column updated")
         except KosDBError as e:
             QMessageBox.critical(self, "Error", str(e))
 
     def drop_column(self, row: int):
         col_name = self.table.item(row, 0).text()
+        if col_name == self.primary_key:
+            QMessageBox.warning(
+                self, "Warning",
+                "Cannot drop the primary key column."
+            )
+            return
+
         reply = QMessageBox.question(
             self, "Confirm",
             f"Drop column '{col_name}'?\n\n"
@@ -382,11 +431,20 @@ class StructureTab(QWidget):
 
         try:
             self.client.use_database(self.db_name)
-            self.client.drop_column(self.table_name, col_name)
-            self.columns.pop(row)
+            new_columns = list(self.columns)
+            new_columns.pop(row)
+            new_indexes = list(self.indexes)
+            if col_name in new_indexes:
+                new_indexes.remove(col_name)
+            self.client.alter_table(
+                self.table_name, new_columns,
+                primary_key=self.primary_key,
+                indexes=new_indexes
+            )
+            self.columns = new_columns
+            self.indexes = new_indexes
             self.table.removeRow(row)
             self.info_label.setText(f"{len(self.columns)} column(s)")
             self.structure_changed.emit()
-            QMessageBox.information(self, "Success", "Column dropped")
         except KosDBError as e:
             QMessageBox.critical(self, "Error", str(e))

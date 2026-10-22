@@ -168,9 +168,20 @@ class KosDBClient:
         return getattr(self, "_current_database", None)
 
     def _infer_schema(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """Infer table schema from a SELECT * query."""
+        """Read table schema via DESCRIBE, fall back to SELECT *."""
         try:
             self.use_database(self._current_database)
+            raw = self.execute(f"DESCRIBE {table_name}")
+            if raw.startswith("ERROR:"):
+                raise KosDBError(raw)
+            schema = json.loads(raw)
+            if schema:
+                return schema
+        except Exception:
+            pass
+
+        # Fallback: infer from data rows
+        try:
             result = self.execute_query(f"SELECT * FROM {table_name}")
             columns = result.get("columns", [])
             if not columns:
@@ -206,71 +217,27 @@ class KosDBClient:
     def drop_table(self, name: str) -> str:
         return self.execute_command(f"DROP TABLE {name}")
 
-    def add_column(self, table_name: str, col_name: str, col_type: str,
-                   indexed: bool = False, default: str = "") -> str:
-        """Add a column by recreating the table with the new schema."""
-        return self._alter_table(table_name, "add", {
-            "name": col_name,
-            "type": col_type,
-            "indexed": indexed,
-            "default": default
-        })
+    def alter_table(self, table_name: str, columns: list, primary_key: str = None,
+                    indexes: list = None, next_id: int = None) -> str:
+        """Full client-side ALTER TABLE: recreate table with given column specs.
 
-    def rename_column(self, table_name: str, old_name: str, new_name: str) -> str:
-        """Rename a column by rewriting every row's key."""
-        return self._alter_table(table_name, "rename", {
-            "old": old_name,
-            "new": new_name
-        })
-
-    def drop_column(self, table_name: str, col_name: str) -> str:
-        """Drop a column by recreating the table without it."""
-        return self._alter_table(table_name, "drop", {"name": col_name})
-
-    def _alter_table(self, table_name: str, operation: str, params: dict) -> str:
-        """Client-side ALTER TABLE implementation."""
+        Args:
+            table_name: Table to alter.
+            columns: List of column names in the desired order.
+            primary_key: Name of the primary key column, if any.
+            indexes: List of indexed column names.
+            next_id: Optional next auto-increment value to restore.
+        """
         import json
+        indexes = list(indexes or [])
 
-        # KosDB has no wire-protocol command to read the schema and the server
-        # keeps the LevelDB file locked. Infer the schema from a SELECT * query
-        # and treat every column as a regular column (no PK/index metadata).
         schema = self._infer_schema(table_name)
         if not schema:
             raise KosDBError(f"Could not infer schema for table '{table_name}'")
 
-        columns = list(schema.get("columns", []))
-        primary_key = schema.get("primary_key")
-        indexes = list(schema.get("indexes", []))
+        old_next_id = schema.get("next_id", 1)
 
-        if operation == "add":
-            col_name = params["name"]
-            if col_name in columns:
-                raise KosDBError(f"Column '{col_name}' already exists")
-            columns.append(col_name)
-            if params.get("indexed") and col_name not in indexes:
-                indexes.append(col_name)
-        elif operation == "drop":
-            col_name = params["name"]
-            if col_name not in columns:
-                raise KosDBError(f"Column '{col_name}' does not exist")
-            if col_name == primary_key:
-                raise KosDBError("Cannot drop primary key column")
-            columns.remove(col_name)
-            if col_name in indexes:
-                indexes.remove(col_name)
-        elif operation == "rename":
-            old_name, new_name = params["old"], params["new"]
-            if old_name not in columns:
-                raise KosDBError(f"Column '{old_name}' does not exist")
-            if new_name in columns:
-                raise KosDBError(f"Column '{new_name}' already exists")
-            columns[columns.index(old_name)] = new_name
-            if old_name in indexes:
-                indexes[indexes.index(old_name)] = new_name
-            if primary_key == old_name:
-                primary_key = new_name
-
-        # Build new CREATE TABLE statement
+        # Build column specs for CREATE TABLE
         col_specs = []
         for col in columns:
             spec = col
@@ -280,29 +247,19 @@ class KosDBClient:
                 spec += " INDEX"
             col_specs.append(spec)
 
-        # Read existing rows (raw JSON, not formatted)
+        # Read existing rows
         rows_raw = self.execute(f"SELECT * FROM {table_name}")
         try:
-            rows_result = json.loads(rows_raw)
-            rows = rows_result.get("rows", [])
+            rows = json.loads(rows_raw).get("rows", [])
         except Exception:
             rows = []
 
-        # Apply schema change: drop old table, create new, re-insert rows
+        # Recreate table
         self.execute_command(f"DROP TABLE {table_name}")
         self.create_table(table_name, col_specs)
 
+        # Re-insert rows (only columns that still exist)
         for row in rows:
-            if operation == "drop":
-                row.pop(params["name"], None)
-            elif operation == "rename":
-                if params["old"] in row:
-                    row[params["new"]] = row.pop(params["old"])
-            elif operation == "add":
-                if params["name"] not in row:
-                    row[params["name"]] = params.get("default", "")
-
-            # Build INSERT with remaining columns
             available_cols = [c for c in columns if c in row]
             if not available_cols:
                 continue
@@ -311,7 +268,40 @@ class KosDBClient:
             val_list = ", ".join(self._sql_quote(v) for v in values)
             self.execute_command(f"INSERT INTO {table_name} ({col_list}) VALUES ({val_list})")
 
+        # Restore next_id
+        target_next_id = next_id if next_id is not None else old_next_id
+        if target_next_id > 1:
+            self.execute_command(f"SET TABLE {table_name} next_id {target_next_id}")
+
         return f"OK: Table '{table_name}' altered"
+
+    def rename_column(self, table_name: str, old_name: str, new_name: str) -> str:
+        """Rename a column by rewriting every row's key."""
+        schema = self._infer_schema(table_name)
+        if not schema:
+            raise KosDBError(f"Could not infer schema for table '{table_name}'")
+
+        columns = list(schema.get("columns", []))
+        if old_name not in columns:
+            raise KosDBError(f"Column '{old_name}' does not exist")
+        if new_name in columns:
+            raise KosDBError(f"Column '{new_name}' already exists")
+        columns[columns.index(old_name)] = new_name
+
+        indexes = list(schema.get("indexes", []))
+        if old_name in indexes:
+            indexes[indexes.index(old_name)] = new_name
+
+        primary_key = schema.get("primary_key")
+        if primary_key == old_name:
+            primary_key = new_name
+
+        return self.alter_table(
+            table_name, columns,
+            primary_key=primary_key,
+            indexes=indexes,
+            next_id=schema.get("next_id", 1)
+        )
 
     @staticmethod
     def _sql_quote(value) -> str:
