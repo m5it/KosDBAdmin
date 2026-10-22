@@ -284,10 +284,10 @@ class StructureTab(QWidget):
         if not ok2:
             return
 
-        indexed, _ = QMessageBox.question(
+        indexed = QMessageBox.question(
             self, "Index", f"Create index on '{col_name}'?",
             QMessageBox.Yes | QMessageBox.No
-        )
+        ) == QMessageBox.Yes
 
         default, ok3 = QInputDialog.getText(
             self, "Add column", "Default value (optional):"
