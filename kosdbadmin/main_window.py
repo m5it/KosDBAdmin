@@ -14,6 +14,7 @@ from kosdbadmin.connection_dialog import ConnectionDialog
 from kosdbadmin.kosdb_local import KosDBLocal
 from kosdbadmin.tree_panel import TreePanel
 from kosdbadmin.query_widget import QueryWidget
+from kosdbadmin.search_widget import SearchWidget
 from kosdbadmin.table_browser import TableBrowser
 
 
@@ -60,6 +61,11 @@ class MainWindow(QMainWindow):
         query_action.triggered.connect(self.add_query_tab)
         tools_menu.addAction(query_action)
 
+        search_action = QAction("Search", self)
+        search_action.setShortcut("Ctrl+F")
+        search_action.triggered.connect(self.add_search_tab)
+        tools_menu.addAction(search_action)
+
         refresh_action = QAction("Refresh tree", self)
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_tree)
@@ -81,6 +87,10 @@ class MainWindow(QMainWindow):
         query_btn = QAction("New query", self)
         query_btn.triggered.connect(self.add_query_tab)
         toolbar.addAction(query_btn)
+
+        search_btn = QAction("Search", self)
+        search_btn.triggered.connect(self.add_search_tab)
+        toolbar.addAction(search_btn)
 
         refresh_btn = QAction("Refresh", self)
         refresh_btn.triggered.connect(self.refresh_tree)
@@ -171,17 +181,24 @@ class MainWindow(QMainWindow):
 
     def add_query_tab(self):
         widget = QueryWidget(self.client)
-        title = self._next_query_tab_title()
+        title = self._next_tab_title("Query")
         index = self.tabs.addTab(widget, title)
         self.tabs.setCurrentIndex(index)
         return widget
 
-    def _next_query_tab_title(self) -> str:
+    def add_search_tab(self):
+        widget = SearchWidget(self.client)
+        title = self._next_tab_title("Search")
+        index = self.tabs.addTab(widget, title)
+        self.tabs.setCurrentIndex(index)
+        return widget
+
+    def _next_tab_title(self, prefix: str) -> str:
         existing = {self.tabs.tabText(i) for i in range(self.tabs.count())}
         n = 1
-        while f"Query {n}" in existing:
+        while f"{prefix} {n}" in existing:
             n += 1
-        return f"Query {n}"
+        return f"{prefix} {n}"
 
     def open_table_tab(self, db_name: str, table_name: str):
         title = f"{db_name}.{table_name}"
