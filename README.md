@@ -1,6 +1,6 @@
 # KosDBAdmin
 
-A lightweight PyQt5 administration client for [KosDB](https://github.com/yourname/kosdb) — a LevelDB socket database with SQL-like command support.
+A lightweight PyQt5 administration client for [KosDB](https://github.com/m5it/kosdb) — a LevelDB socket database with SQL-like command support.
 
 KosDBAdmin provides a phpMyAdmin-like GUI for managing KosDB databases, tables, and data.
 
