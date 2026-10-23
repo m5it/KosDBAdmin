@@ -12,6 +12,8 @@ KosDBAdmin provides a phpMyAdmin-like GUI for managing KosDB databases, tables, 
 - Browse table data with automatic column sizing
 - View table structure (columns, primary key, indexes)
 - Create/drop databases and tables from the UI
+- Export databases or individual tables to SQL dump files
+- Import SQL dump files through the connected server
 
 ## Requirements
 
@@ -42,6 +44,17 @@ python main.py
 ```
 
 Connect with host `localhost`, port `5555`, and your KosDB credentials.
+
+### Export and Import
+
+KosDBAdmin can export and import SQL dumps through the connected KosDB server (the server must be running).
+
+- **Tools → Export database...** — export a whole database to a `.sql` file.
+- **Tools → Import SQL...** — execute a `.sql` dump against the current server.
+- Right-click a database in the tree → **Export database...**
+- Right-click a table in the tree → **Export table...**
+
+The generated dump uses plain SQL compatible with KosDB (`CREATE DATABASE`, `USE`, `DROP TABLE IF EXISTS`, `CREATE TABLE`, `SET TABLE ... next_id`, `INSERT`). When importing, existing tables are automatically recreated so the dump can be replayed cleanly.
 
 ## Project Structure
 

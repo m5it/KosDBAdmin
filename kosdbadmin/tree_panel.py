@@ -3,7 +3,8 @@
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
-    QMenu, QMessageBox, QInputDialog, QAbstractItemView
+    QMenu, QMessageBox, QInputDialog, QAbstractItemView,
+    QFileDialog
 )
 
 from kosdbadmin.client import KosDBClient, KosDBError
@@ -108,6 +109,8 @@ class TreePanel(QWidget):
             refresh.triggered.connect(lambda: self.refresh_database(item))
             create_table = menu.addAction("Create table...")
             create_table.triggered.connect(lambda: self.create_table(item.text(0)))
+            export_db = menu.addAction("Export database...")
+            export_db.triggered.connect(lambda: self.export_database(item.text(0)))
             drop_db = menu.addAction("Drop database")
             drop_db.triggered.connect(lambda: self.drop_database(item.text(0)))
         elif kind == "table":
@@ -115,6 +118,8 @@ class TreePanel(QWidget):
             table_name = item.text(0)
             refresh = menu.addAction("Refresh")
             refresh.triggered.connect(lambda: self.refresh_table(db_name, table_name))
+            export_table = menu.addAction("Export table...")
+            export_table.triggered.connect(lambda: self.export_table(db_name, table_name))
             drop_table = menu.addAction("Drop table")
             drop_table.triggered.connect(lambda: self.drop_table(db_name, table_name))
         else:
@@ -186,6 +191,30 @@ class TreePanel(QWidget):
                 self.refresh_database(self._db_item(db_name))
             except KosDBError as e:
                 QMessageBox.critical(self, "Error", str(e))
+
+    def export_database(self, db_name: str):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export database", f"{db_name}.sql", "SQL dumps (*.sql);;All files (*.*)"
+        )
+        if not file_path:
+            return
+        try:
+            result = self.client.export_database(db_name, file_path)
+            QMessageBox.information(self, "Export complete", result)
+        except KosDBError as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    def export_table(self, db_name: str, table_name: str):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export table", f"{db_name}_{table_name}.sql", "SQL dumps (*.sql);;All files (*.*)"
+        )
+        if not file_path:
+            return
+        try:
+            result = self.client.export_table(db_name, table_name, file_path)
+            QMessageBox.information(self, "Export complete", result)
+        except KosDBError as e:
+            QMessageBox.critical(self, "Export failed", str(e))
 
     def _db_item(self, db_name: str) -> QTreeWidgetItem:
         for i in range(self.root.childCount()):

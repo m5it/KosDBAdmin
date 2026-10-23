@@ -323,3 +323,125 @@ class KosDBClient:
         """Return the number of rows in a table."""
         data = self.table_data(db_name, table_name)
         return data.get("count", len(data.get("rows", [])))
+
+    def export_database(self, db_name: str, file_path: str) -> str:
+        """Export a whole database to a SQL dump file via the server."""
+        self.use_database(db_name)
+        tables = self.list_tables()
+
+        lines = [
+            f"-- KosDB dump of database '{db_name}'",
+            f"CREATE DATABASE {db_name};",
+            f"USE {db_name};",
+            "",
+        ]
+
+        for table_name in tables:
+            lines.extend(self._dump_table_sql(db_name, table_name))
+            lines.append("")
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        return f"Exported {len(tables)} table(s) to {file_path}"
+
+    def export_table(self, db_name: str, table_name: str, file_path: str) -> str:
+        """Export a single table to a SQL dump file via the server."""
+        lines = [
+            f"-- KosDB dump of {db_name}.{table_name}",
+            f"CREATE DATABASE {db_name};",
+            f"USE {db_name};",
+            "",
+        ]
+        lines.extend(self._dump_table_sql(db_name, table_name))
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        return f"Exported table to {file_path}"
+
+    def _dump_table_sql(self, db_name: str, table_name: str) -> List[str]:
+        """Return SQL statements for a single table."""
+        self.use_database(db_name)
+        schema = self._infer_schema(table_name)
+        if not schema:
+            return [f"-- Table '{table_name}' schema not found"]
+
+        columns = schema.get("columns", [])
+        primary_key = schema.get("primary_key")
+        indexes = schema.get("indexes", [])
+        next_id = schema.get("next_id", 1)
+
+        col_specs = []
+        for col in columns:
+            if col == primary_key and col.lower() == "id":
+                spec = f"{col} INTEGER PRIMARY KEY"
+            else:
+                spec = f"{col} TEXT"
+            if col in indexes:
+                spec += " INDEX"
+            col_specs.append(spec)
+
+        lines = [f"DROP TABLE IF EXISTS {table_name};"]
+        lines.append(f"CREATE TABLE {table_name} ({', '.join(col_specs)});")
+
+        if primary_key and primary_key.lower() == "id" and next_id > 1:
+            lines.append(f"SET TABLE {table_name} next_id {next_id};")
+
+        data = self.execute_query(f"SELECT * FROM {table_name}")
+        rows = data.get("rows", [])
+        for row in rows:
+            row_columns = [col for col in columns if col in row]
+            if not row_columns:
+                continue
+            values = [self._sql_quote(row[col]) for col in row_columns]
+            col_list = ", ".join(row_columns)
+            val_list = ", ".join(values)
+            lines.append(f"INSERT INTO {table_name} ({col_list}) VALUES ({val_list});")
+
+        return lines
+
+    def import_sql(self, file_path: str) -> str:
+        """Execute a SQL dump file through the connected server."""
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        statements = self._split_statements(content)
+        executed = 0
+        errors = []
+
+        for stmt in statements:
+            try:
+                self.execute_command(stmt)
+                executed += 1
+            except KosDBError as e:
+                errors.append(f"{stmt[:60]}...: {e}")
+
+        if errors:
+            return f"Imported {executed} statement(s), {len(errors)} error(s):\n" + "\n".join(errors)
+        return f"Imported {executed} statement(s) from {file_path}"
+
+    @staticmethod
+    def _split_statements(sql: str) -> List[str]:
+        """Split SQL dump into executable statements, stripping comments."""
+        import re
+        lines = []
+        in_multiline = False
+        for line in sql.splitlines():
+            stripped = line.strip()
+            if in_multiline:
+                if "*/" in stripped:
+                    in_multiline = False
+                continue
+            if stripped.startswith("/*"):
+                if "*/" not in stripped:
+                    in_multiline = True
+                continue
+            if stripped.startswith("--") or stripped.startswith("#"):
+                continue
+            line = re.sub(r"--.*$", "", line)
+            lines.append(line)
+
+        cleaned = "\n".join(lines)
+        statements = [s.strip() for s in cleaned.split(";") if s.strip()]
+        return statements

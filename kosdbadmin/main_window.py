@@ -6,7 +6,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QAction, QMessageBox,
-    QLabel, QStatusBar, QToolBar, QFileDialog
+    QLabel, QStatusBar, QToolBar, QFileDialog, QInputDialog
 )
 
 from kosdbadmin.client import KosDBClient, KosDBError
@@ -70,6 +70,16 @@ class MainWindow(QMainWindow):
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_tree)
         tools_menu.addAction(refresh_action)
+
+        tools_menu.addSeparator()
+
+        export_action = QAction("Export database...", self)
+        export_action.triggered.connect(self.export_database)
+        tools_menu.addAction(export_action)
+
+        import_action = QAction("Import SQL...", self)
+        import_action.triggered.connect(self.import_sql)
+        tools_menu.addAction(import_action)
 
         help_menu = menubar.addMenu("Help")
         about_action = QAction("About", self)
@@ -172,6 +182,46 @@ class MainWindow(QMainWindow):
     def refresh_tree(self):
         if self.tree_panel:
             self.tree_panel.refresh()
+
+    def export_database(self):
+        if not self.client:
+            QMessageBox.warning(self, "Not connected", "Connect to a server first.")
+            return
+
+        db_name, ok = QInputDialog.getText(self, "Export database", "Database name:")
+        if not ok or not db_name.strip():
+            return
+        db_name = db_name.strip()
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export to SQL file", f"{db_name}.sql", "SQL dumps (*.sql);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            result = self.client.export_database(db_name, file_path)
+            QMessageBox.information(self, "Export complete", result)
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    def import_sql(self):
+        if not self.client:
+            QMessageBox.warning(self, "Not connected", "Connect to a server first.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import SQL file", "", "SQL dumps (*.sql);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            result = self.client.import_sql(file_path)
+            QMessageBox.information(self, "Import complete", result)
+            self.refresh_tree()
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", str(e))
 
     def on_database_selected(self, db_name: str):
         pass
