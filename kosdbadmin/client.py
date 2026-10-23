@@ -326,6 +326,9 @@ class KosDBClient:
 
     def export_database(self, db_name: str, file_path: str) -> str:
         """Export a whole database to a SQL dump file via the server."""
+        dbs = self.list_databases()
+        if db_name not in dbs:
+            raise KosDBError(f"ERROR: Database '{db_name}' does not exist")
         self.use_database(db_name)
         tables = self.list_tables()
 
@@ -347,6 +350,11 @@ class KosDBClient:
 
     def export_table(self, db_name: str, table_name: str, file_path: str) -> str:
         """Export a single table to a SQL dump file via the server."""
+        # Validate database exists before trying to describe the table.
+        dbs = self.list_databases()
+        if db_name not in dbs:
+            raise KosDBError(f"ERROR: Database '{db_name}' does not exist")
+
         lines = [
             f"-- KosDB dump of {db_name}.{table_name}",
             f"CREATE DATABASE {db_name};",

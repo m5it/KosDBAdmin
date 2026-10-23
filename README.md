@@ -49,7 +49,7 @@ Connect with host `localhost`, port `5555`, and your KosDB credentials.
 
 KosDBAdmin can export and import SQL dumps through the connected KosDB server (the server must be running).
 
-- **Tools → Export database...** — export a whole database to a `.sql` file.
+- **Tools → Export database...** — export a whole database (e.g. `testdb`) or a single table (`testdb.users`) to a `.sql` file.
 - **Tools → Import SQL...** — execute a `.sql` dump against the current server.
 - Right-click a database in the tree → **Export database...**
 - Right-click a table in the tree → **Export table...**

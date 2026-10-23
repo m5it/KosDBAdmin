@@ -188,19 +188,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not connected", "Connect to a server first.")
             return
 
-        db_name, ok = QInputDialog.getText(self, "Export database", "Database name:")
-        if not ok or not db_name.strip():
+        target, ok = QInputDialog.getText(
+            self, "Export", "Database name or database.table:"
+        )
+        if not ok or not target.strip():
             return
-        db_name = db_name.strip()
+        target = target.strip()
 
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export to SQL file", f"{db_name}.sql", "SQL dumps (*.sql);;All files (*.*)"
+            self, "Export to SQL file", f"{target}.sql", "SQL dumps (*.sql);;All files (*.*)"
         )
         if not file_path:
             return
 
         try:
-            result = self.client.export_database(db_name, file_path)
+            if "." in target:
+                db_name, table_name = target.split(".", 1)
+                result = self.client.export_table(db_name, table_name, file_path)
+            else:
+                result = self.client.export_database(target, file_path)
             QMessageBox.information(self, "Export complete", result)
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
