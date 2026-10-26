@@ -148,11 +148,21 @@ class MainWindow(QMainWindow):
             if not self.client:
                 self.status_label.setText("Disconnected")
 
+    def _try_enable_framing(self, client: KosDBClient):
+        """Enable length-prefixed framing if the server supports it."""
+        try:
+            client.enable_framing()
+        except Exception:
+            client.framing = False
+
     def set_client(self, client: KosDBClient):
         self.client = client
         # Try to locate the server's data directory for local metadata reads.
         self.local = KosDBLocal(self._guess_data_dir())
-        self.status_label.setText(f"Connected to {client.host}:{client.port} as {client.username}")
+        proto = "TLS" if client.is_encrypted() else "plain"
+        self.status_label.setText(
+            f"Connected to {client.host}:{client.port} as {client.username} ({proto})"
+        )
 
         # Replace tree panel
         if self.tree_panel:
@@ -167,6 +177,9 @@ class MainWindow(QMainWindow):
 
         # Add default query tab
         self.add_query_tab()
+
+        # Prefer framed protocol for this connection.
+        self._try_enable_framing(client)
 
     def disconnect(self):
         if self.client:

@@ -32,6 +32,9 @@ class ConnectionDialog(QDialog):
         self.pass_edit = QLineEdit(password)
         self.pass_edit.setEchoMode(QLineEdit.Password)
 
+        self.tls_check = QCheckBox("Use TLS")
+        self.tls_check.setChecked(False)
+
         self.save_check = QCheckBox("Remember credentials (not encrypted)")
         self.save_check.setChecked(False)
 
@@ -39,6 +42,7 @@ class ConnectionDialog(QDialog):
         form.addRow("Port:", self.port_edit)
         form.addRow("Username:", self.user_edit)
         form.addRow("Password:", self.pass_edit)
+        form.addRow("TLS:", self.tls_check)
         layout.addLayout(form)
         layout.addWidget(self.save_check)
 
@@ -63,12 +67,14 @@ class ConnectionDialog(QDialog):
 
         username = self.user_edit.text().strip()
         password = self.pass_edit.text()
+        use_tls = self.tls_check.isChecked()
 
         self.status_label.setText("Connecting...")
         self.setEnabled(False)
 
         client = KosDBClient(host=host, port=port,
-                             username=username, password=password)
+                             username=username, password=password,
+                             use_tls=use_tls)
         try:
             client.connect()
             if not client.login():

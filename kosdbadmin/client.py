@@ -3,6 +3,7 @@
 import json
 import os
 import socket
+import ssl
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,37 +17,70 @@ class KosDBClient:
     """TCP socket client for KosDB command protocol."""
 
     def __init__(self, host: str = "localhost", port: int = 5555,
-                 username: str = "", password: str = ""):
+                 username: str = "", password: str = "",
+                 use_tls: bool = False, tls_cert: Optional[str] = None,
+                 tls_require_valid: bool = True):
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.use_tls = use_tls
+        self.tls_cert = tls_cert
+        self.tls_require_valid = tls_require_valid
         self.socket: Optional[socket.socket] = None
         self.authenticated = False
         self.json_mode = False
+        self.framing = False
         self._current_database: Optional[str] = None
 
     def connect(self) -> str:
         """Connect and return the server welcome message."""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.settimeout(30)
-        self.socket.connect((self.host, self.port))
+        plain_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        plain_socket.settimeout(5)
+        plain_socket.connect((self.host, self.port))
 
-        # Server sends a welcome banner plus a help line (often in one packet).
-        # We may need to wait briefly or receive two packets.
-        welcome = self._receive()
-        if welcome is None:
+        if self.use_tls:
+            context = ssl.create_default_context()
+            if self.tls_cert:
+                context.load_verify_locations(self.tls_cert)
+            if not self.tls_require_valid:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self.socket = context.wrap_socket(
+                plain_socket, server_hostname=self.host
+            )
+        else:
+            self.socket = plain_socket
+
+        # The server sends the welcome banner and help line as one or two
+        # newline-terminated lines. Read enough to get both, leaving extra bytes
+        # buffered for later reads.
+        buffer = b""
+        while buffer.count(b"\n") < 2:
+            try:
+                chunk = self.socket.recv(4096)
+            except socket.timeout:
+                break
+            except ssl.SSLWantReadError:
+                # TLS handshake still in progress; wait briefly and retry.
+                time.sleep(0.01)
+                continue
+            except Exception as e:
+                raise KosDBError(f"Failed to receive: {e}")
+            if not chunk:
+                break
+            buffer += chunk
+        if not buffer:
             raise KosDBError("No welcome message from server")
-        # If the server split banner and help into two packets, merge them.
-        try:
-            self.socket.settimeout(0.5)
-            extra = self._receive()
-            if extra:
-                welcome += "\n" + extra
-        except Exception:
-            pass
-        finally:
-            self.socket.settimeout(30)
+        lines = buffer.splitlines()
+        if len(lines) > 2:
+            self._read_buffer = b"\n".join(lines[2:]) + b"\n"
+            lines = lines[:2]
+        else:
+            self._read_buffer = b""
+        welcome = "\n".join(line.decode("utf-8", errors="replace").strip()
+                            for line in lines)
+        self.socket.settimeout(None)
         return welcome
 
     def disconnect(self):
@@ -60,12 +94,38 @@ class KosDBClient:
                 self.socket = None
                 self.authenticated = False
                 self.json_mode = False
+                self.framing = False
+
+    def is_encrypted(self) -> bool:
+        """Return True if the current connection uses TLS."""
+        return isinstance(self.socket, ssl.SSLSocket)
 
     def login(self) -> bool:
         """Authenticate with LOGIN command."""
+        if not self.is_encrypted() and not self._is_loopback():
+            raise KosDBError(
+                "Refusing to send credentials over plain TCP to a remote host. "
+                "Enable TLS (use_tls=True) or connect via a secure tunnel."
+            )
         response = self.execute(f"LOGIN {self.username} {self.password}")
         self.authenticated = "OK:" in response and "Welcome" in response
+        if self.authenticated:
+            # Prefer framed protocol when the server supports it.
+            try:
+                self.enable_framing()
+            except Exception:
+                self.framing = False
         return self.authenticated
+
+    def _is_loopback(self) -> bool:
+        """Return True if the configured host resolves to a loopback address."""
+        if self.host in ("localhost", "127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return True
+        try:
+            addr = socket.getaddrinfo(self.host, None)[0][4][0]
+            return addr.startswith("127.") or addr == "::1" or addr == "::ffff:127."
+        except Exception:
+            return False
 
     def enable_json(self) -> bool:
         """Ask server to return query results as JSON."""
@@ -73,15 +133,18 @@ class KosDBClient:
         self.json_mode = "OK:" in response
         return self.json_mode
 
+    def enable_framing(self) -> bool:
+        """Ask server to use length-prefixed response framing."""
+        response = self.execute("SET FRAMING ON")
+        self.framing = "enabled" in response.lower()
+        return self.framing
+
     def execute(self, command: str) -> str:
         """Send a single command and return the raw text response."""
         if not self.socket:
             raise KosDBError("Not connected")
 
-        try:
-            self.socket.sendall(command.encode() + b"\n")
-        except Exception as e:
-            raise KosDBError(f"Failed to send command: {e}")
+        self._send(command)
 
         response = self._receive()
         if response is None:
@@ -91,32 +154,123 @@ class KosDBClient:
     def _send(self, message: str):
         if not self.socket:
             raise KosDBError("Not connected")
-        self.socket.sendall(message.encode() + b"\n")
+        payload = message.encode()
+        if self.framing:
+            header = f"{len(payload)}\n".encode()
+            self.socket.sendall(header + payload + b"\n")
+        else:
+            self.socket.sendall(payload + b"\n")
 
     def _receive(self) -> Optional[str]:
         if not self.socket:
             return None
+        if self.framing:
+            return self._receive_framed()
+        return self._receive_all()
+
+
+    def _receive_all(self) -> Optional[str]:
+        """Read all data available for a line-based server response."""
+        if not self.socket:
+            return None
+        buffer = getattr(self, "_read_buffer", b"")
+        self._read_buffer = b""
+        # The server sends each complete response in one burst. Read until no
+        # more data arrives for a short interval. TLS sockets may raise
+        # SSLWantReadError during the initial handshake, so retry briefly.
+        self.socket.settimeout(0.1)
         try:
-            data = self.socket.recv(65536)
-            if not data:
-                return None
-            return data.decode("utf-8", errors="replace").strip()
-        except socket.timeout:
-            raise KosDBError("Connection timeout")
-        except Exception as e:
-            raise KosDBError(f"Failed to receive: {e}")
+            while True:
+                try:
+                    chunk = self.socket.recv(4096)
+                except socket.timeout:
+                    break
+                except ssl.SSLWantReadError:
+                    time.sleep(0.01)
+                    continue
+                if not chunk:
+                    break
+                buffer += chunk
+        finally:
+            self.socket.settimeout(None)
+        if not buffer:
+            return None
+        return buffer.decode("utf-8", errors="replace").strip()
+
+    def _read_until(self, marker: bytes) -> bytes:
+        """Read from the socket until marker is seen; leftover bytes are buffered."""
+        buffer = getattr(self, "_read_buffer", b"")
+        self._read_buffer = b""
+        while marker not in buffer:
+            try:
+                chunk = self.socket.recv(4096)
+            except socket.timeout:
+                raise KosDBError("Connection timeout")
+            except Exception as e:
+                raise KosDBError(f"Failed to receive: {e}")
+            if not chunk:
+                raise KosDBError("Server closed connection")
+            buffer += chunk
+        result, _, leftover = buffer.partition(marker)
+        if leftover:
+            self._read_buffer = leftover
+        return result
 
     def _receive_line(self) -> Optional[str]:
         """Receive a single line terminated by \\n."""
         if not self.socket:
             return None
+        data = self._read_until(b"\n")
+        if data is None:
+            return None
+        return data.decode("utf-8", errors="replace").strip()
+
+    def _receive_framed(self) -> Optional[str]:
+        """Receive a length-prefixed framed response."""
+        if not self.socket:
+            return None
+        header = self._read_until(b"\n")
+        if not header:
+            return None
         try:
-            data = self.socket.recv(4096)
-            if not data:
-                return None
-            return data.decode("utf-8", errors="replace").strip()
-        except Exception as e:
-            raise KosDBError(f"Failed to receive line: {e}")
+            length = int(header.decode("utf-8", errors="replace").strip())
+        except ValueError:
+            raise KosDBError("Invalid framing header from server")
+        if length < 0:
+            raise KosDBError("Invalid framing length from server")
+
+        # Read exactly length bytes.
+        buffer = getattr(self, "_read_buffer", b"")
+        self._read_buffer = b""
+        while len(buffer) < length:
+            try:
+                chunk = self.socket.recv(max(4096, length - len(buffer)))
+            except socket.timeout:
+                raise KosDBError("Connection timeout")
+            except Exception as e:
+                raise KosDBError(f"Failed to receive: {e}")
+            if not chunk:
+                raise KosDBError("Server closed connection during framed response")
+            buffer += chunk
+
+        payload = buffer[:length]
+        leftover = buffer[length:]
+        # The server terminates each framed payload with a newline. Consume it.
+        if leftover.startswith(b"\n"):
+            leftover = leftover[1:]
+        else:
+            try:
+                delim = self.socket.recv(1)
+            except socket.timeout:
+                raise KosDBError("Connection timeout")
+            except Exception as e:
+                raise KosDBError(f"Failed to receive: {e}")
+            if delim and delim != b"\n":
+                # Misbehaving server; keep the byte for the next read.
+                leftover += delim
+        if leftover:
+            self._read_buffer = leftover
+        return payload.decode("utf-8", errors="replace")
 
     def execute_query(self, query: str) -> Dict[str, Any]:
         """Execute a SELECT-like query and return parsed JSON result."""
@@ -153,10 +307,13 @@ class KosDBClient:
         raw = self.execute("SHOW DATABASES")
         if raw.startswith("ERROR:"):
             raise KosDBError(raw)
+        # Server formats as "OK:\n" followed by one database per line.
         prefix = "OK:\n"
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
-        if raw in ("OK: No databases", ""):
+        elif raw.startswith("OK:"):
+            raw = raw[len("OK:"):].lstrip()
+        if raw.startswith("OK: No databases") or raw == "":
             return []
         return [line.strip() for line in raw.splitlines() if line.strip()]
 
@@ -201,7 +358,9 @@ class KosDBClient:
         prefix = "OK:\n"
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
-        if raw in ("OK: No tables", ""):
+        elif raw.startswith("OK:"):
+            raw = raw[len("OK:"):].lstrip()
+        if raw.startswith("OK: No tables") or raw == "":
             return []
         return [line.strip() for line in raw.splitlines() if line.strip()]
 
