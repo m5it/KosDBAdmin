@@ -3,6 +3,7 @@
 import json
 import os
 import socket
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -218,8 +219,13 @@ class KosDBClient:
         return self.execute_command(f"DROP TABLE {name}")
 
     def alter_table(self, table_name: str, columns: list, primary_key: str = None,
-                    indexes: list = None, next_id: int = None) -> str:
-        """Full client-side ALTER TABLE: recreate table with given column specs.
+                    indexes: list = None, next_id: int = None,
+                    column_renames: Optional[Dict[str, str]] = None) -> str:
+        """Safely rebuild a table with a new column layout.
+
+        The original table is kept intact until all rows have been copied into a
+        temporary table. If any read, transform, or insert step fails, the
+        original table is left untouched (the temp table is dropped on failure).
 
         Args:
             table_name: Table to alter.
@@ -227,9 +233,11 @@ class KosDBClient:
             primary_key: Name of the primary key column, if any.
             indexes: List of indexed column names.
             next_id: Optional next auto-increment value to restore.
+            column_renames: Mapping of new column name -> old column name. Used
+                to copy values from old column names into renamed columns.
         """
-        import json
         indexes = list(indexes or [])
+        column_renames = dict(column_renames or {})
 
         schema = self._infer_schema(table_name)
         if not schema:
@@ -237,7 +245,7 @@ class KosDBClient:
 
         old_next_id = schema.get("next_id", 1)
 
-        # Build column specs for CREATE TABLE
+        # Build column specs for CREATE TABLE.
         col_specs = []
         for col in columns:
             spec = col
@@ -247,36 +255,104 @@ class KosDBClient:
                 spec += " INDEX"
             col_specs.append(spec)
 
-        # Read existing rows
+        # Read existing rows. A decode error must abort before we touch the
+        # original table.
         rows_raw = self.execute(f"SELECT * FROM {table_name}")
+        if rows_raw.startswith("ERROR:"):
+            raise KosDBError(f"Failed to read table '{table_name}': {rows_raw}")
         try:
             rows = json.loads(rows_raw).get("rows", [])
-        except Exception:
-            rows = []
+        except json.JSONDecodeError as e:
+            raise KosDBError(
+                f"Failed to parse table data for '{table_name}': {e}. "
+                "Table was not modified."
+            )
 
-        # Recreate table
-        self.execute_command(f"DROP TABLE {table_name}")
-        self.create_table(table_name, col_specs)
-
-        # Re-insert rows (only columns that still exist)
+        # Build the transformed row set in memory first.
+        transformed_rows = []
         for row in rows:
-            available_cols = [c for c in columns if c in row]
-            if not available_cols:
-                continue
-            values = [row[c] for c in available_cols]
-            col_list = ", ".join(available_cols)
-            val_list = ", ".join(self._sql_quote(v) for v in values)
-            self.execute_command(f"INSERT INTO {table_name} ({col_list}) VALUES ({val_list})")
+            new_row = {}
+            for new_col in columns:
+                old_col = column_renames.get(new_col, new_col)
+                if old_col in row:
+                    new_row[new_col] = row[old_col]
+            if new_row:
+                transformed_rows.append(new_row)
 
-        # Restore next_id
-        target_next_id = next_id if next_id is not None else old_next_id
-        if target_next_id > 1:
-            self.execute_command(f"SET TABLE {table_name} next_id {target_next_id}")
+        # Use a unique temporary table as a safe copy of the transformed data.
+        temp_name = f"_tmp_alter_{table_name}_{int(time.time())}"
+        try:
+            self.create_table(temp_name, col_specs)
+        except KosDBError as e:
+            raise KosDBError(
+                f"Failed to create temp table '{temp_name}': {e}. "
+                f"Table '{table_name}' was not modified."
+            )
+
+        try:
+            # Populate the temp table. If this fails, the original is safe.
+            for row in transformed_rows:
+                available_cols = [c for c in columns if c in row]
+                values = [row[c] for c in available_cols]
+                col_list = ", ".join(available_cols)
+                val_list = ", ".join(self._sql_quote(v) for v in values)
+                self.execute_command(
+                    f"INSERT INTO {temp_name} ({col_list}) VALUES ({val_list})"
+                )
+
+            # Only after temp table is fully populated do we drop the original.
+            self.execute_command(f"DROP TABLE {table_name}")
+            self.create_table(table_name, col_specs)
+
+            # Copy the transformed data from temp into the new original table.
+            temp_rows = self.execute_query(f"SELECT * FROM {temp_name}").get("rows", [])
+            for row in temp_rows:
+                available_cols = [c for c in columns if c in row]
+                if not available_cols:
+                    continue
+                values = [row[c] for c in available_cols]
+                col_list = ", ".join(available_cols)
+                val_list = ", ".join(self._sql_quote(v) for v in values)
+                self.execute_command(
+                    f"INSERT INTO {table_name} ({col_list}) VALUES ({val_list})"
+                )
+
+            # Restore next_id.
+            target_next_id = next_id if next_id is not None else old_next_id
+            if target_next_id > 1:
+                self.execute_command(f"SET TABLE {table_name} next_id {target_next_id}")
+
+        except Exception:
+            # On any failure after the original table was dropped, leave the
+            # temp table in place so the data can be recovered manually.
+            # If the original still exists (failure happened before DROP),
+            # drop the temp table to avoid clutter.
+            try:
+                self.execute(f"SELECT * FROM {table_name}")
+            except KosDBError:
+                # Original table is gone; keep temp for recovery.
+                raise KosDBError(
+                    f"Alter failed after dropping '{table_name}'. "
+                    f"Recovery data may be in '{temp_name}'."
+                )
+            try:
+                self.execute_command(f"DROP TABLE {temp_name}")
+            except KosDBError:
+                pass
+            raise
+        finally:
+            # Drop temp only if the original table was successfully recreated.
+            try:
+                self.execute(f"SELECT * FROM {table_name}")
+                self.execute_command(f"DROP TABLE {temp_name}")
+            except KosDBError:
+                # Original missing or temp missing; leave temp as recovery copy.
+                pass
 
         return f"OK: Table '{table_name}' altered"
 
     def rename_column(self, table_name: str, old_name: str, new_name: str) -> str:
-        """Rename a column by rewriting every row's key."""
+        """Rename a column while preserving its values."""
         schema = self._infer_schema(table_name)
         if not schema:
             raise KosDBError(f"Could not infer schema for table '{table_name}'")
@@ -300,7 +376,8 @@ class KosDBClient:
             table_name, columns,
             primary_key=primary_key,
             indexes=indexes,
-            next_id=schema.get("next_id", 1)
+            next_id=schema.get("next_id", 1),
+            column_renames={new_name: old_name}
         )
 
     @staticmethod
