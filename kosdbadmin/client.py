@@ -16,7 +16,7 @@ class KosDBError(Exception):
 class KosDBClient:
     """TCP socket client for KosDB command protocol."""
 
-    def __init__(self, host: str = "localhost", port: int = 5555,
+    def __init__(self, host: str = "localhost", port: int = 3306,
                  username: str = "", password: str = "",
                  use_tls: bool = False, tls_cert: Optional[str] = None,
                  tls_require_valid: bool = True):
@@ -547,18 +547,31 @@ class KosDBClient:
             return str(value)
         if isinstance(value, (list, dict)):
             import json
-            return f"'{json.dumps(value).replace(chr(39), chr(39)+chr(39))}'"
-        return f"'{str(value).replace(chr(39), chr(39)+chr(39))}'"
+            return "'" + json.dumps(value).replace(chr(39), chr(39)+chr(39)).replace("\\", "\\\\") + "'"
+        return "'" + str(value).replace("\\", "\\\\").replace(chr(39), chr(39)+chr(39)).replace("\n", "\\n").replace("\r", "\\r") + "'"
 
-    def table_data(self, db_name: str, table_name: str) -> Dict[str, Any]:
-        """Return all rows for a table."""
+    def table_data(self, db_name: str, table_name: str,
+                   limit: Optional[int] = None,
+                   offset: Optional[int] = None,
+                   order_by: Optional[str] = None,
+                   order_desc: bool = False) -> Dict[str, Any]:
+        """Return rows for a table, optionally paginated and ordered."""
         self.use_database(db_name)
-        return self.execute_query(f"SELECT * FROM {table_name}")
+        clause = f"SELECT * FROM {table_name}"
+        if order_by:
+            clause += f" ORDER BY {order_by}"
+            if order_desc:
+                clause += " DESC"
+        if limit is not None:
+            clause += f" LIMIT {limit}"
+        if offset is not None:
+            clause += f" OFFSET {offset}"
+        return self.execute_query(clause)
 
     def table_count(self, db_name: str, table_name: str) -> int:
-        """Return the number of rows in a table."""
-        data = self.table_data(db_name, table_name)
-        return data.get("count", len(data.get("rows", [])))
+        """Return the total number of rows in a table."""
+        data = self.table_data(db_name, table_name, limit=0)
+        return data.get("total", data.get("count", 0))
 
     def export_database(self, db_name: str, file_path: str) -> str:
         """Export a whole database to a SQL dump file via the server."""
@@ -616,12 +629,14 @@ class KosDBClient:
         indexes = schema.get("indexes", [])
         next_id = schema.get("next_id", 1)
 
+        column_types = schema.get("column_types", {})
         col_specs = []
         for col in columns:
-            if col == primary_key and col.lower() == "id":
-                spec = f"{col} INTEGER PRIMARY KEY"
+            col_type = column_types.get(col, "TEXT").upper()
+            if col == primary_key:
+                spec = f"{col} {col_type} PRIMARY KEY"
             else:
-                spec = f"{col} TEXT"
+                spec = f"{col} {col_type}"
             if col in indexes:
                 spec += " INDEX"
             col_specs.append(spec)
@@ -629,7 +644,7 @@ class KosDBClient:
         lines = [f"DROP TABLE IF EXISTS {table_name};"]
         lines.append(f"CREATE TABLE {table_name} ({', '.join(col_specs)});")
 
-        if primary_key and primary_key.lower() == "id" and next_id > 1:
+        if primary_key and next_id > 1:
             lines.append(f"SET TABLE {table_name} next_id {next_id};")
 
         data = self.execute_query(f"SELECT * FROM {table_name}")
@@ -653,13 +668,18 @@ class KosDBClient:
         statements = self._split_statements(content)
         executed = 0
         errors = []
+        failed = False
 
         for stmt in statements:
+            if failed:
+                errors.append(f"Skipped after earlier error: {stmt[:60]}")
+                continue
             try:
                 self.execute_command(stmt)
                 executed += 1
             except KosDBError as e:
                 errors.append(f"{stmt[:60]}...: {e}")
+                failed = True
 
         if errors:
             return f"Imported {executed} statement(s), {len(errors)} error(s):\n" + "\n".join(errors)
@@ -667,25 +687,85 @@ class KosDBClient:
 
     @staticmethod
     def _split_statements(sql: str) -> List[str]:
-        """Split SQL dump into executable statements, stripping comments."""
-        import re
-        lines = []
-        in_multiline = False
-        for line in sql.splitlines():
-            stripped = line.strip()
-            if in_multiline:
-                if "*/" in stripped:
-                    in_multiline = False
-                continue
-            if stripped.startswith("/*"):
-                if "*/" not in stripped:
-                    in_multiline = True
-                continue
-            if stripped.startswith("--") or stripped.startswith("#"):
-                continue
-            line = re.sub(r"--.*$", "", line)
-            lines.append(line)
+        """Split SQL dump into executable statements, ignoring comments.
 
-        cleaned = "\n".join(lines)
-        statements = [s.strip() for s in cleaned.split(";") if s.strip()]
+        Statement boundaries are only recognised at top-level semicolons so that
+        semicolons inside quoted string literals are not treated as terminators.
+        """
+        import re
+        # Strip block comments first.
+        sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+        statements = []
+        current = []
+        quote_char = None
+        escape = False
+        for ch in sql:
+            if escape:
+                current.append(ch)
+                escape = False
+                continue
+            if ch == "\\" and quote_char in ("'", '"'):
+                current.append(ch)
+                escape = True
+                continue
+            if quote_char is None:
+                if ch in ("'", '"'):
+                    quote_char = ch
+                    current.append(ch)
+                elif ch == ";":
+                    stmt = "".join(current).strip()
+                    stmt = KosDBClient._strip_line_comments(stmt)
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+                else:
+                    current.append(ch)
+            else:
+                current.append(ch)
+                if ch == quote_char:
+                    quote_char = None
+        stmt = "".join(current).strip()
+        stmt = KosDBClient._strip_line_comments(stmt)
+        if stmt:
+            statements.append(stmt)
         return statements
+
+    @staticmethod
+    def _strip_line_comments(stmt: str) -> str:
+        """Remove line-style comments from a statement without touching quoted strings."""
+        result = []
+        quote_char = None
+        escape = False
+        i = 0
+        while i < len(stmt):
+            ch = stmt[i]
+            if escape:
+                result.append(ch)
+                escape = False
+                i += 1
+                continue
+            if ch == "\\" and quote_char in ("'", '"'):
+                result.append(ch)
+                escape = True
+                i += 1
+                continue
+            if quote_char is None:
+                if ch in ("'", '"'):
+                    quote_char = ch
+                    result.append(ch)
+                elif ch == "-" and i + 1 < len(stmt) and stmt[i + 1] == "-":
+                    while i < len(stmt) and stmt[i] != "\n":
+                        i += 1
+                    continue
+                elif ch == "#":
+                    while i < len(stmt) and stmt[i] != "\n":
+                        i += 1
+                    continue
+                else:
+                    result.append(ch)
+            else:
+                result.append(ch)
+                if ch == quote_char:
+                    quote_char = None
+            i += 1
+        return "".join(result).strip()

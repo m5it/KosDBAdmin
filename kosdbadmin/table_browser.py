@@ -5,9 +5,10 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QLabel, QHBoxLayout, QPushButton,
-    QMessageBox, QInputDialog, QMenu, QDialog
+    QMessageBox, QInputDialog, QMenu, QDialog, QComboBox
 )
 
+from kosdbadmin.async_worker import TableQueryWorker
 from kosdbadmin.client import KosDBClient, KosDBError
 from kosdbadmin.column_dialog import ColumnDialog
 from kosdbadmin.utils import format_value
@@ -104,14 +105,46 @@ class TableBrowser(QWidget):
 
 
 class DataTab(QWidget):
-    """Browse all rows of a table."""
+    """Browse rows of a table with pagination."""
+
+    PAGE_SIZES = [100, 250, 500, 1000]
+    DEFAULT_PAGE_SIZE = 500
 
     def __init__(self, client: KosDBClient, parent=None):
         super().__init__(parent)
         self.client = client
+        self.db_name = ""
+        self.table_name = ""
+        self.page = 0
+        self.page_size = self.DEFAULT_PAGE_SIZE
+        self.total = 0
+        self.order_by = None
+        self._worker = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        # Pagination toolbar
+        pagination = QHBoxLayout()
+        self.page_size_combo = QComboBox()
+        for size in self.PAGE_SIZES:
+            self.page_size_combo.addItem(str(size), size)
+        self.page_size_combo.setCurrentIndex(self.PAGE_SIZES.index(self.DEFAULT_PAGE_SIZE))
+        self.page_size_combo.currentIndexChanged.connect(self._page_size_changed)
+
+        self.prev_btn = QPushButton("< Previous")
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.next_btn = QPushButton("Next >")
+        self.next_btn.clicked.connect(self._next_page)
+        self.page_label = QLabel("Page 1 of 1")
+
+        pagination.addWidget(QLabel("Page size:"))
+        pagination.addWidget(self.page_size_combo)
+        pagination.addStretch()
+        pagination.addWidget(self.prev_btn)
+        pagination.addWidget(self.page_label)
+        pagination.addWidget(self.next_btn)
+        layout.addLayout(pagination)
 
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -124,19 +157,64 @@ class DataTab(QWidget):
         layout.addWidget(self.status)
 
     def load(self, db_name: str, table_name: str):
+        self.db_name = db_name
+        self.table_name = table_name
+        self.page = 0
+        self.order_by = None
+        try:
+            self.client.use_database(db_name)
+            schema = json.loads(self.client.execute(f"DESCRIBE {table_name}"))
+            if "id" in schema.get("columns", []):
+                self.order_by = "id"
+        except Exception:
+            pass
+        self._load_page()
+
+    def refresh(self):
+        if self.db_name and self.table_name:
+            self._load_page()
+
+    def _page_size_changed(self):
+        self.page_size = int(self.page_size_combo.currentData())
+        self.page = 0
+        self._load_page()
+
+    def _prev_page(self):
+        if self.page > 0:
+            self.page -= 1
+            self._load_page()
+
+    def _next_page(self):
+        if (self.page + 1) * self.page_size < self.total:
+            self.page += 1
+            self._load_page()
+
+    def _load_page(self):
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status.setText("Loading...")
+        self._set_pagination_enabled(False)
 
-        try:
-            result = self.client.table_data(db_name, table_name)
-        except KosDBError as e:
-            self.status.setText(f"Error: {e}")
-            return
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(1000)
 
+        offset = self.page * self.page_size
+        self._worker = TableQueryWorker(
+            self.client, self.db_name, self.table_name,
+            limit=self.page_size, offset=offset,
+            order_by=self.order_by
+        )
+        self._worker.results_ready.connect(self._on_results)
+        self._worker.error_occurred.connect(self._on_error)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    def _on_results(self, result: dict):
         columns = result.get("columns", [])
         rows = result.get("rows", [])
+        self.total = result.get("total", len(rows))
 
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels(columns)
@@ -149,7 +227,24 @@ class DataTab(QWidget):
                 self.table.setItem(ridx, cidx, item)
 
         self.table.resizeColumnsToContents()
-        self.status.setText(f"{len(rows)} row(s)")
+        self._update_pagination()
+        self.status.setText(f"{self.total} total row(s) | showing {len(rows)} row(s)")
+
+    def _on_error(self, message: str):
+        self.status.setText(f"Error: {message}")
+        self._set_pagination_enabled(False)
+
+    def _update_pagination(self):
+        total_pages = max(1, (self.total + self.page_size - 1) // self.page_size)
+        self.page_label.setText(f"Page {self.page + 1} of {total_pages}")
+        self.prev_btn.setEnabled(self.page > 0)
+        self.next_btn.setEnabled((self.page + 1) * self.page_size < self.total)
+        self.page_size_combo.setEnabled(True)
+
+    def _set_pagination_enabled(self, enabled: bool):
+        self.prev_btn.setEnabled(enabled and self.page > 0)
+        self.next_btn.setEnabled(enabled and (self.page + 1) * self.page_size < self.total)
+        self.page_size_combo.setEnabled(enabled)
 
 
 class StructureTab(QWidget):

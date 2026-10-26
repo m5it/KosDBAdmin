@@ -13,7 +13,7 @@ from kosdbadmin.client import KosDBClient, KosDBError
 class ConnectionDialog(QDialog):
     """Dialog to collect KosDB connection details and authenticate."""
 
-    def __init__(self, parent=None, host="localhost", port=5555,
+    def __init__(self, parent=None, host="localhost", port=3306,
                  username="", password=""):
         super().__init__(parent)
         self.setWindowTitle("Connect to KosDB")

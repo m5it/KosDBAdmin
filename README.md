@@ -43,7 +43,7 @@ Then run KosDBAdmin:
 python main.py
 ```
 
-Connect with host `localhost`, port `5555`, and your KosDB credentials.
+Connect with host `localhost`, port `3306`, and your KosDB credentials.
 
 ### Export and Import
 
