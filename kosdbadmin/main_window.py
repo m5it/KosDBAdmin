@@ -295,7 +295,7 @@ class MainWindow(QMainWindow):
             self, "About KosDBAdmin",
             "<b>KosDBAdmin</b><br>"
             "A PyQt5 administration client for KosDB.<br><br>"
-            "Version 0.1.0"
+            "Version 0.1.1"
         )
 
     def _query_tab_count(self) -> int:
