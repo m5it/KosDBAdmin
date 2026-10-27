@@ -196,20 +196,19 @@ class DataTab(QWidget):
         self.status.setText("Loading...")
         self._set_pagination_enabled(False)
 
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(1000)
+        self._cancel_worker()
 
         offset = self.page * self.page_size
         self._worker = TableQueryWorker(
             self.client, self.db_name, self.table_name,
             limit=self.page_size, offset=offset,
-            order_by=self.order_by
+            order_by=self.order_by, parent=self
         )
-        self._worker.results_ready.connect(self._on_results)
-        self._worker.error_occurred.connect(self._on_error)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        worker = self._worker
+        worker.results_ready.connect(self._on_results)
+        worker.error_occurred.connect(self._on_error)
+        worker.finished.connect(lambda: self._worker_finished(worker))
+        worker.start()
 
     def _on_results(self, result: dict):
         columns = result.get("columns", [])
@@ -245,6 +244,23 @@ class DataTab(QWidget):
         self.prev_btn.setEnabled(enabled and self.page > 0)
         self.next_btn.setEnabled(enabled and (self.page + 1) * self.page_size < self.total)
         self.page_size_combo.setEnabled(enabled)
+
+    def _worker_finished(self, worker):
+        if self._worker is worker:
+            self._worker = None
+
+    def _cancel_worker(self):
+        if self._worker is None:
+            return
+        try:
+            running = self._worker.isRunning()
+        except RuntimeError:
+            self._worker = None
+            return
+        if running:
+            self._worker.quit()
+            self._worker.wait(1000)
+        self._worker = None
 
 
 class StructureTab(QWidget):

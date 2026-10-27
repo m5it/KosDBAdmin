@@ -182,12 +182,14 @@ class SearchWidget(QWidget):
         self._cancel_worker()
 
         self._worker = TableQueryWorker(
-            self.client, db_name, table_name, limit=None, offset=0
+            self.client, db_name, table_name, limit=None, offset=0,
+            parent=self
         )
-        self._worker.results_ready.connect(self._on_search_data)
-        self._worker.error_occurred.connect(self._on_search_error)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        worker = self._worker
+        worker.results_ready.connect(self._on_search_data)
+        worker.error_occurred.connect(self._on_search_error)
+        worker.finished.connect(lambda: self._worker_finished(worker))
+        worker.start()
 
     def _on_search_data(self, result: dict):
         self._columns = result.get("columns", [])
@@ -252,10 +254,22 @@ class SearchWidget(QWidget):
         self.next_btn.setEnabled(False)
         self.page_size_combo.setEnabled(enabled)
 
+    def _worker_finished(self, worker):
+        if self._worker is worker:
+            self._worker = None
+
     def _cancel_worker(self):
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is None:
+            return
+        try:
+            running = self._worker.isRunning()
+        except RuntimeError:
+            self._worker = None
+            return
+        if running:
             self._worker.quit()
             self._worker.wait(1000)
+        self._worker = None
 
     def _filter_rows(self, rows, columns, search_col, operator, value):
         matches = []
