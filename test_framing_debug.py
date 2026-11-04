@@ -19,7 +19,8 @@ except Exception as e:
 s.settimeout(5)
 
 cmd = b"SHOW DATABASES"
-s.sendall(f"{len(cmd)}\n".encode() + cmd)
+# Framed protocol: length\npayload\n
+s.sendall(f"{len(cmd)}\n".encode() + cmd + b"\n")
 # Read header
 header = b""
 while True:
@@ -36,5 +37,7 @@ while len(data) < length:
     if not chunk:
         break
     data += chunk
+# Consume trailing newline after payload
+s.recv(1)
 print("show:", data)
 s.close()

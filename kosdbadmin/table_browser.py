@@ -260,6 +260,16 @@ class DataTab(QWidget):
         if running:
             self._worker.quit()
             self._worker.wait(1000)
+            try:
+                if self._worker.isRunning():
+                    self._worker.terminate()
+                    self._worker.wait(1000)
+            except RuntimeError:
+                pass
+        try:
+            self._worker.deleteLater()
+        except RuntimeError:
+            pass
         self._worker = None
 
 

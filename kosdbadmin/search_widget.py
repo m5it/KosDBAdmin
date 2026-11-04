@@ -45,18 +45,30 @@ class SearchWidget(QWidget):
         self.column_combo.setMinimumWidth(150)
 
         self.operator_combo = QComboBox()
-        self.operator_combo.addItems(["=", "LIKE", "!=", "<", ">", "<=", ">="])
+        self.operator_combo.addItems(["(any)", "=", "LIKE", "!=", "<", ">", "<=", ">="])
         self.operator_combo.setMinimumWidth(80)
 
         self.value_edit = QLineEdit()
         self.value_edit.setPlaceholderText("Search value")
         self.value_edit.returnPressed.connect(self.run_search)
 
+        self.order_by_combo = QComboBox()
+        self.order_by_combo.addItem("(none)")
+        self.order_by_combo.setMinimumWidth(150)
+        self.order_by_combo.currentIndexChanged.connect(self._order_changed)
+
+        self.order_dir_combo = QComboBox()
+        self.order_dir_combo.addItems(["ASC", "DESC"])
+        self.order_dir_combo.setMinimumWidth(80)
+        self.order_dir_combo.currentIndexChanged.connect(self._order_changed)
+
         form.addRow("Database:", self.db_combo)
         form.addRow("Table:", self.table_combo)
         form.addRow("Column:", self.column_combo)
         form.addRow("Operator:", self.operator_combo)
         form.addRow("Value:", self.value_edit)
+        form.addRow("Order by:", self.order_by_combo)
+        form.addRow("Direction:", self.order_dir_combo)
         layout.addLayout(form)
 
         # Toolbar
@@ -73,6 +85,14 @@ class SearchWidget(QWidget):
 
         self.status_label = QLabel("Ready")
         layout.addWidget(self.status_label)
+
+        # Query preview
+        self.query_preview = QLabel("Query: ")
+        self.query_preview.setWordWrap(True)
+        self.query_preview.setStyleSheet(
+            "QLabel { color: #555; font-family: monospace; font-size: 11px; }"
+        )
+        layout.addWidget(self.query_preview)
 
         # Pagination toolbar
         pagination = QHBoxLayout()
@@ -141,6 +161,8 @@ class SearchWidget(QWidget):
     def on_table_changed(self, index: int):
         self.column_combo.clear()
         self.column_combo.addItem("* (all columns)")
+        self.order_by_combo.clear()
+        self.order_by_combo.addItem("(none)")
         table_name = self.table_combo.currentText()
         db_name = self.db_combo.currentText()
         if not table_name or not db_name:
@@ -157,6 +179,9 @@ class SearchWidget(QWidget):
 
         for col in columns:
             self.column_combo.addItem(col)
+            self.order_by_combo.addItem(col)
+        if "id" in columns:
+            self.order_by_combo.setCurrentText("id")
 
     def clear_results(self):
         self.result_table.clear()
@@ -168,32 +193,53 @@ class SearchWidget(QWidget):
         self.page_label.setText("Page 1 of 1")
         self._set_pagination_enabled(False)
         self.status_label.setText("Ready")
+        self.query_preview.setText("Query: ")
 
     def run_search(self):
         db_name = self.db_combo.currentText()
         table_name = self.table_combo.currentText()
+        column = self.column_combo.currentText()
+        operator = self.operator_combo.currentText()
+        value = self.value_edit.text().strip()
+        order_by = self._current_order_by()
+        order_desc = self.order_dir_combo.currentText() == "DESC"
 
         if not db_name or not table_name:
             QMessageBox.warning(self, "Warning", "Select a database and table first")
             return
 
+        self.query_preview.setText(self._build_query_text(
+            db_name, table_name, column, operator, value, order_by, order_desc
+        ))
         self.status_label.setText("Loading...")
         self._set_pagination_enabled(False)
         self._cancel_worker()
 
-        self._worker = TableQueryWorker(
+        self._all_rows = []
+        self._columns = []
+        self._page = 0
+
+        self._current_query_id = getattr(self, "_current_query_id", 0) + 1
+        query_id = self._current_query_id
+        worker = TableQueryWorker(
             self.client, db_name, table_name, limit=None, offset=0,
+            order_by=order_by, order_desc=order_desc,
             parent=self
         )
-        worker = self._worker
-        worker.results_ready.connect(self._on_search_data)
-        worker.error_occurred.connect(self._on_search_error)
-        worker.finished.connect(lambda: self._worker_finished(worker))
-        worker.start()
+        self._worker = worker
+        self._worker.results_ready.connect(lambda result: self._on_search_data(result, query_id))
+        self._worker.error_occurred.connect(self._on_search_error)
+        self._worker.finished.connect(lambda: self._worker_finished(worker))
+        self._worker.start()
 
-    def _on_search_data(self, result: dict):
-        self._columns = result.get("columns", [])
-        self._all_rows = result.get("rows", [])
+    def _on_search_data(self, result: dict, query_id: int):
+        if getattr(self, "_current_query_id", 0) != query_id:
+            # Result from an older worker; ignore it.
+            return
+        columns = result.get("columns", [])
+        rows = result.get("rows", [])
+        self._columns = columns
+        self._all_rows = rows
         self._page = 0
 
         if not self._columns:
@@ -208,12 +254,24 @@ class SearchWidget(QWidget):
         self._set_pagination_enabled(False)
 
     def _apply_filter_and_show(self):
+        if not self._columns:
+            return
         column = self.column_combo.currentText()
         operator = self.operator_combo.currentText()
         value = self.value_edit.text().strip()
         search_col = None if column == "* (all columns)" else column
+        order_by = self._current_order_by()
+        order_desc = self.order_dir_combo.currentText() == "DESC"
 
+        if operator == "(any)":
+            value = ""
         matches = self._filter_rows(self._all_rows, self._columns, search_col, operator, value)
+        if order_by:
+            matches = sorted(
+                matches,
+                key=lambda r: r.get(order_by, "") or "",
+                reverse=order_desc
+            )
         total = len(matches)
         start = self._page * self._page_size
         page_rows = matches[start:start + self._page_size]
@@ -227,17 +285,46 @@ class SearchWidget(QWidget):
         self._page = 0
         self._apply_filter_and_show()
 
+    @staticmethod
+    def _build_query_text(db_name, table_name, column, operator, value, order_by, order_desc):
+        parts = [f"USE {db_name};"]
+        where_clause = ""
+        if column != "* (all columns)" and value and operator != "(any)":
+            escaped = value.replace("'", "''")
+            if operator == "LIKE":
+                where_clause = f" WHERE {column} LIKE '%{escaped}%'"
+            elif operator == "=":
+                where_clause = f" WHERE {column} = '{escaped}'"
+            elif operator in ("!=", "<", ">", "<=", ">="):
+                where_clause = f" WHERE {column} {operator} '{escaped}'"
+        select = f"SELECT * FROM {table_name}{where_clause}"
+        if order_by:
+            select += f" ORDER BY {order_by}"
+            if order_desc:
+                select += " DESC"
+        parts.append(select)
+        return "Query: " + " ".join(parts)
+
+    def _current_order_by(self):
+        text = self.order_by_combo.currentText()
+        return None if text == "(none)" else text
+
+    def _order_changed(self):
+        self._apply_filter_and_show()
+
     def _prev_page(self):
         if self._page > 0:
             self._page -= 1
             self._apply_filter_and_show()
 
     def _next_page(self):
-        total = len(self._filter_rows(
-            self._all_rows, self._columns,
-            None if self.column_combo.currentText() == "* (all columns)" else self.column_combo.currentText(),
-            self.operator_combo.currentText(), self.value_edit.text().strip()
-        ))
+        column = self.column_combo.currentText()
+        operator = self.operator_combo.currentText()
+        value = self.value_edit.text().strip()
+        if operator == "(any)":
+            value = ""
+        search_col = None if column == "* (all columns)" else column
+        total = len(self._filter_rows(self._all_rows, self._columns, search_col, operator, value))
         if (self._page + 1) * self._page_size < total:
             self._page += 1
             self._apply_filter_and_show()
@@ -259,17 +346,27 @@ class SearchWidget(QWidget):
             self._worker = None
 
     def _cancel_worker(self):
-        if self._worker is None:
+        w = getattr(self, "_worker", None)
+        if w is None:
             return
+        self._worker = None
         try:
-            running = self._worker.isRunning()
+            running = w.isRunning()
         except RuntimeError:
-            self._worker = None
             return
         if running:
-            self._worker.quit()
-            self._worker.wait(1000)
-        self._worker = None
+            w.quit()
+            w.wait(1000)
+            try:
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(1000)
+            except RuntimeError:
+                pass
+        try:
+            w.deleteLater()
+        except RuntimeError:
+            pass
 
     def _filter_rows(self, rows, columns, search_col, operator, value):
         matches = []
@@ -284,6 +381,8 @@ class SearchWidget(QWidget):
 
     @staticmethod
     def _match(cell_value: str, operator: str, search_value: str) -> bool:
+        if operator == "(any)" or not search_value:
+            return True
         if operator == "LIKE":
             pattern = search_value.strip("'\"")
             return pattern.lower() in cell_value.lower()

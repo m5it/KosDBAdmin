@@ -60,6 +60,17 @@ def main():
 
     browser = TableBrowser(client)
     browser.load("testdb_smoke", "smoke_table")
+
+    # Wait for the async worker to finish loading the first page
+    for _ in range(100):
+        app.processEvents()
+        if browser.data_tab.table.rowCount() >= 1:
+            break
+        if browser.data_tab._worker is not None:
+            browser.data_tab._worker.wait(50)
+    else:
+        raise AssertionError("Table browser has no rows")
+
     assert browser.data_tab.table.rowCount() >= 1, "Table browser has no rows"
 
     # Test client export/import

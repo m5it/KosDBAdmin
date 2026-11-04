@@ -38,3 +38,5 @@ class TableQueryWorker(QThread):
             self.error_occurred.emit(str(e))
         except Exception as e:
             self.error_occurred.emit(f"Unexpected error: {e}")
+
+
