@@ -72,4 +72,4 @@ main.py                  # Entry point
 
 ## License
 
-MIT
+Copyright 2026 Blaz Kos — Modified Apache License 2.0 with additional commercial-use terms. The project is provided on an **AS IS** basis without any warranty. Contact [w4d4f4k@gmail.com](mailto:w4d4f4k@gmail.com) for a full text copy and for any commercial licensing or notification obligations. See [LICENSE](LICENSE) for details.
